@@ -159,6 +159,110 @@ def _extract_metric_at_time(
     }
 
 
+def _extract_confusion_counts_from_csv(
+    csv_path: str,
+    *,
+    use_totals: bool = True,
+    target_time_ns: Optional[float] = None,
+    count_cols: Sequence[str] = ("tp", "fp", "fn"),
+):
+    """
+    Extract TP/FP/FN counts from one per_frame_metrics.csv.
+
+    If use_totals=True:
+        sums TP/FP/FN over all frames.
+
+    If use_totals=False:
+        uses the row closest to target_time_ns.
+    """
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"Could not find CSV: {csv_path}")
+
+    df = pd.read_csv(csv_path).copy()
+
+    required = set(count_cols)
+    if not use_totals:
+        required = required | {"time_ns"}
+
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"CSV missing required columns {missing}: {csv_path}")
+
+    for c in count_cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+
+    if use_totals:
+        counts = {c: float(df[c].sum()) for c in count_cols}
+        time_ns_used = None
+        row_index = None
+    else:
+        if target_time_ns is None:
+            raise ValueError("target_time_ns must be provided when use_totals=False")
+
+        df["time_ns"] = pd.to_numeric(df["time_ns"], errors="coerce")
+        df = df.dropna(subset=["time_ns"]).reset_index(drop=True)
+
+        if len(df) == 0:
+            raise ValueError(f"No valid rows with time_ns in: {csv_path}")
+
+        idx = (df["time_ns"] - float(target_time_ns)).abs().idxmin()
+        row = df.loc[idx]
+
+        counts = {c: float(row[c]) for c in count_cols}
+        time_ns_used = float(row["time_ns"])
+        row_index = int(idx)
+
+    return {
+        "counts": counts,
+        "time_ns_used": time_ns_used,
+        "row_index": row_index,
+    }
+
+
+
+def _extract_classification_metrics_from_csv(
+    csv_path: str,
+    *,
+    use_totals: bool = True,
+    target_time_ns: Optional[float] = None,
+):
+    """
+    Extract F1, recall, and precision from one per_frame_metrics.csv.
+
+    If use_totals=True:
+        sums TP/FP/FN over all frames, then computes global full-simulation metrics.
+
+    If use_totals=False:
+        uses the row closest to target_time_ns and computes metrics from that row.
+    """
+    info = _extract_confusion_counts_from_csv(
+        csv_path,
+        use_totals=use_totals,
+        target_time_ns=target_time_ns,
+        count_cols=("tp", "fp", "fn"),
+    )
+
+    counts = info["counts"]
+
+    tp = float(counts["tp"])
+    fp = float(counts["fp"])
+    fn = float(counts["fn"])
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else np.nan
+    recall = tp / (tp + fn) if (tp + fn) > 0 else np.nan
+    f1 = (2.0 * tp) / (2.0 * tp + fp + fn) if (2.0 * tp + fp + fn) > 0 else np.nan
+
+    return {
+        "metrics": {
+            "f1": f1,
+            "recall": recall,
+            "precision": precision,
+        },
+        "counts": counts,
+        "time_ns_used": info["time_ns_used"],
+        "row_index": info["row_index"],
+    }
+
 def _plot_subset(
     csv_map_subset: Dict[str, Dict[str, str]],
     save_path: str,
@@ -220,9 +324,9 @@ def _plot_subset(
                 }
             )
 
-    plt.xlabel(x_label, fontsize=18)
-    plt.ylabel(y_label if y_label is not None else y_col, fontsize=18)
-    plt.title(title, fontsize=18)
+    plt.xlabel(x_label, fontsize=28)
+    plt.ylabel(y_label if y_label is not None else y_col, fontsize=28)
+    plt.title(title, fontsize=24)
 
     if y_lim is not None:
         plt.ylim(*y_lim)
@@ -233,7 +337,7 @@ def _plot_subset(
     plt.grid(True, alpha=0.3)
     plt.legend(loc="center left", bbox_to_anchor=(1.02, 0.5))
     plt.tight_layout()
-    plt.savefig(save_path, dpi=300)
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
 
     if show:
         plt.show()
@@ -314,7 +418,7 @@ def _plot_individual_simulations(
             plt.yticks(fontsize=16)
             plt.grid(True, alpha=0.3)
             plt.tight_layout()
-            plt.savefig(save_path, dpi=300)
+            plt.savefig(save_path, dpi=300, bbox_inches="tight")
 
             if show:
                 plt.show()
@@ -342,40 +446,44 @@ def plot_training_loss_comparison(
     loss_csv_map: Dict[str, str],
     out_dir: str,
     *,
-    out_name_loss: str = "training_loss_comparison.png",
-    out_name_val_loss: str = "validation_loss_comparison.png",
-    title_loss: str = "Training Loss Comparison",
-    title_val_loss: str = "Validation Loss Comparison",
+    out_name_loss: str = "training_and_validation_loss_comparison.png",
+    out_name_val_loss: str = "training_and_validation_loss_comparison.png",
+    title_loss: str = "Training and Validation Loss Comparison",
+    title_val_loss: str = "Training and Validation Loss Comparison",
     max_epoch: Optional[float] = None,
     show: bool = False,
     linewidth: float = 2.0,
     colors: Optional[Sequence[str]] = None,
 ):
     """
-    Plot training/validation loss curves from training log CSVs.
+    Plot training and validation loss curves on the same figure.
 
     Each CSV should contain:
       - epoch
       - loss
     and may also contain:
       - val_loss
+
+    Line styles:
+      - solid  : training loss
+      - dashed : validation loss
     """
     os.makedirs(out_dir, exist_ok=True)
 
     save_loss = os.path.join(out_dir, out_name_loss)
-    save_val_loss = os.path.join(out_dir, out_name_val_loss)
 
     if colors is not None and len(colors) > 0:
-        train_colors = list(colors)
+        plot_colors = list(colors)
     else:
-        train_colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", [])
-        if not train_colors:
-            train_colors = [None]
+        plot_colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", [])
+        if not plot_colors:
+            plot_colors = [None]
 
     loaded = []
+    has_any_val_loss = False
 
     plt.figure(figsize=(11, 6))
-    color_cycle = cycle(train_colors)
+    color_cycle = cycle(plot_colors)
 
     for model_name, csv_path in loss_csv_map.items():
         if not os.path.exists(csv_path):
@@ -390,28 +498,55 @@ def plot_training_loss_comparison(
 
         df["epoch"] = pd.to_numeric(df["epoch"], errors="coerce")
         df["loss"] = pd.to_numeric(df["loss"], errors="coerce")
-        df = df.dropna(subset=["epoch", "loss"]).sort_values("epoch").reset_index(drop=True)
+
+        has_val_loss_this_model = "val_loss" in df.columns
+        if has_val_loss_this_model:
+            df["val_loss"] = pd.to_numeric(df["val_loss"], errors="coerce")
+
+        df = df.sort_values("epoch").reset_index(drop=True)
+        df_train = df.dropna(subset=["epoch", "loss"]).copy()
 
         if max_epoch is not None:
-            df = df[df["epoch"] <= max_epoch].copy()
+            df_train = df_train[df_train["epoch"] <= max_epoch].copy()
 
         color = next(color_cycle)
 
         plt.plot(
-            df["epoch"].to_numpy(),
-            df["loss"].to_numpy(),
-            label=model_name,
+            df_train["epoch"].to_numpy(),
+            df_train["loss"].to_numpy(),
+            label=f"{model_name} train",
             linestyle="-",
             color=color,
             linewidth=linewidth,
         )
 
+        val_points = 0
+        if has_val_loss_this_model:
+            df_val = df.dropna(subset=["epoch", "val_loss"]).copy()
+
+            if max_epoch is not None:
+                df_val = df_val[df_val["epoch"] <= max_epoch].copy()
+
+            if len(df_val) > 0:
+                has_any_val_loss = True
+                val_points = len(df_val)
+
+                plt.plot(
+                    df_val["epoch"].to_numpy(),
+                    df_val["val_loss"].to_numpy(),
+                    label=f"{model_name} val",
+                    linestyle="--",
+                    color=color,
+                    linewidth=linewidth,
+                )
+
         loaded.append(
             {
                 "model": model_name,
                 "csv_path": csv_path,
-                "n_points": len(df),
-                "has_val_loss": "val_loss" in df.columns,
+                "n_train_points": len(df_train),
+                "n_val_points": val_points,
+                "has_val_loss": has_val_loss_this_model,
                 "color": color,
                 "max_epoch": max_epoch,
             }
@@ -422,79 +557,27 @@ def plot_training_loss_comparison(
     plt.title(title_loss, fontsize=18)
     plt.xticks(fontsize=16)
     plt.yticks(fontsize=16)
+
     if max_epoch is not None:
         plt.xlim(0, max_epoch)
+
     plt.grid(True, alpha=0.3)
-    plt.legend(loc="center left", bbox_to_anchor=(1.02, 0.5))
+    plt.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize = 18)
     plt.tight_layout()
-    plt.savefig(save_loss, dpi=300)
+    plt.savefig(save_loss, dpi=300, bbox_inches="tight")
 
     if show:
         plt.show()
     else:
         plt.close()
 
-    print(f"Saved training loss plot to: {save_loss}")
-
-    has_any_val_loss = False
-    plt.figure(figsize=(11, 6))
-    color_cycle = cycle(train_colors)
-
-    for model_name, csv_path in loss_csv_map.items():
-        color = next(color_cycle)
-        df = pd.read_csv(csv_path).copy()
-
-        if "epoch" not in df.columns or "val_loss" not in df.columns:
-            continue
-
-        df["epoch"] = pd.to_numeric(df["epoch"], errors="coerce")
-        df["val_loss"] = pd.to_numeric(df["val_loss"], errors="coerce")
-        df = df.dropna(subset=["epoch", "val_loss"]).sort_values("epoch").reset_index(drop=True)
-
-        if max_epoch is not None:
-            df = df[df["epoch"] <= max_epoch].copy()
-
-        if len(df) == 0:
-            continue
-
-        has_any_val_loss = True
-
-        plt.plot(
-            df["epoch"].to_numpy(),
-            df["val_loss"].to_numpy(),
-            label=model_name,
-            linestyle="-",
-            color=color,
-            linewidth=linewidth,
-        )
-
-    val_loss_path = None
-    if has_any_val_loss:
-        plt.xlabel("Epoch", fontsize=18)
-        plt.ylabel("Validation Loss", fontsize=18)
-        plt.title(title_val_loss, fontsize=18)
-        plt.xticks(fontsize=16)
-        plt.yticks(fontsize=16)
-        if max_epoch is not None:
-            plt.xlim(0, max_epoch)
-        plt.grid(True, alpha=0.3)
-        plt.legend(loc="center left", bbox_to_anchor=(1.02, 0.5))
-        plt.tight_layout()
-        plt.savefig(save_val_loss, dpi=300)
-        val_loss_path = save_val_loss
-        print(f"Saved validation loss plot to: {save_val_loss}")
-
-        if show:
-            plt.show()
-        else:
-            plt.close()
-    else:
-        plt.close()
+    print(f"Saved combined training/validation loss plot to: {save_loss}")
 
     return {
         "training_loss_plot_path": save_loss,
-        "validation_loss_plot_path": val_loss_path,
+        "validation_loss_plot_path": save_loss,
         "loaded_loss_series": loaded,
+        "has_any_val_loss": has_any_val_loss,
     }
 
 
@@ -515,8 +598,8 @@ def plot_metric_bar_at_time(
 ):
     """
     Create a grouped bar chart at a requested time.
-    X-axis groups are velocities.
-    Bars within each group are models (e.g., Base and Base + SED).
+    X-axis groups are the inner csv_map keys.
+    Bars within each group are models.
     """
     os.makedirs(out_dir, exist_ok=True)
     save_path = os.path.join(out_dir, out_name)
@@ -537,12 +620,9 @@ def plot_metric_bar_at_time(
                 velocity_labels.append(vel)
 
     if len(velocity_labels) == 0:
-        raise ValueError("No velocity entries found in csv_map.")
+        raise ValueError("No entries found in csv_map.")
 
-    display_velocity_labels = [
-        str(v).replace("m/s", "").strip()
-        for v in velocity_labels
-    ]
+    display_velocity_labels = [str(v).replace("m/s", "").strip() for v in velocity_labels]
 
     n_models = len(model_order)
     x = np.arange(len(velocity_labels))
@@ -604,10 +684,11 @@ def plot_metric_bar_at_time(
             color=color,
             zorder=3,
         )
+
         plt.grid(True, axis="y", alpha=0.3, zorder=0)
         plt.gca().set_axisbelow(True)
 
-    plt.xlabel("Velocity (m/s)", fontsize=18)
+    plt.xlabel("Velocity / test case", fontsize=18)
     plt.ylabel(y_label if y_label is not None else y_col, fontsize=18)
 
     if title is None:
@@ -624,7 +705,7 @@ def plot_metric_bar_at_time(
     plt.grid(True, axis="y", alpha=0.3)
     plt.legend(loc="center left", bbox_to_anchor=(1.02, 0.5))
     plt.tight_layout()
-    plt.savefig(save_path, dpi=dpi)
+    plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
 
     if show:
         plt.show()
@@ -642,6 +723,472 @@ def plot_metric_bar_at_time(
         "model_order": list(model_order),
     }
 
+
+def plot_confusion_counts_bar_by_geometry(
+    csv_map: Dict[str, Dict[str, str]],
+    out_dir: str,
+    *,
+    out_name: str = "tp_fp_fn_bar_by_geometry.png",
+    title: Optional[str] = None,
+    show: bool = False,
+    model_order: Optional[Sequence[str]] = None,
+    geometry_order: Optional[Sequence[str]] = None,
+    use_totals: bool = True,
+    target_time_ns: Optional[float] = None,
+    count_cols: Sequence[str] = ("tp", "fp", "fn"),
+    count_labels: Optional[Dict[str, str]] = None,
+    colors: Optional[Sequence[str]] = None,
+    xlabel: str = "Test geometry",
+    ylabel: str = "Count",
+    figsize: tuple = (12, 7),
+    dpi: int = 300,
+    rotate_xticks: float = 0,
+    add_value_labels: bool = True,
+):
+    """
+    Create one grouped bar plot with TP, FP, and FN for each geometry.
+
+    Expected csv_map format for one model across different geometries:
+
+    csv_map = {
+        "Base": {
+            "Similar": "/path/to/per_frame_metrics.csv",
+            "Horizontal": "/path/to/per_frame_metrics.csv",
+            "Vertical": "/path/to/per_frame_metrics.csv",
+        }
+    }
+
+    X-axis groups are geometries.
+    Within each geometry group, bars are TP, FP, FN.
+
+    If multiple outer models are passed, x labels become:
+        "Base: Similar", "Base + SED: Similar", etc.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    save_path = os.path.join(out_dir, out_name)
+
+    if count_labels is None:
+        count_labels = {
+            "tp": "True Positives",
+            "fp": "False Positives",
+            "fn": "False Negatives",
+        }
+
+    if model_order is None:
+        model_order = list(csv_map.keys())
+
+    if len(model_order) == 0:
+        raise ValueError("No models found in csv_map.")
+
+    x_categories = []
+
+    if geometry_order is not None:
+        for model_name in model_order:
+            if model_name not in csv_map:
+                continue
+
+            for geom in geometry_order:
+                if geom not in csv_map[model_name]:
+                    continue
+
+                label = str(geom) if len(model_order) == 1 else f"{model_name}: {geom}"
+
+                x_categories.append(
+                    {
+                        "model": model_name,
+                        "geometry": geom,
+                        "label": label,
+                        "csv_path": csv_map[model_name][geom],
+                    }
+                )
+    else:
+        for model_name in model_order:
+            if model_name not in csv_map:
+                continue
+
+            for geom, csv_path in csv_map[model_name].items():
+                label = str(geom) if len(model_order) == 1 else f"{model_name}: {geom}"
+
+                x_categories.append(
+                    {
+                        "model": model_name,
+                        "geometry": geom,
+                        "label": label,
+                        "csv_path": csv_path,
+                    }
+                )
+
+    if len(x_categories) == 0:
+        raise ValueError("No geometry CSV entries found in csv_map.")
+
+    loaded = []
+    values_by_count_col = {c: [] for c in count_cols}
+
+    for item in x_categories:
+        info = _extract_confusion_counts_from_csv(
+            item["csv_path"],
+            use_totals=use_totals,
+            target_time_ns=target_time_ns,
+            count_cols=count_cols,
+        )
+
+        counts = info["counts"]
+
+        for c in count_cols:
+            values_by_count_col[c].append(counts[c])
+
+        loaded_item = {
+            "model": item["model"],
+            "geometry": item["geometry"],
+            "label": item["label"],
+            "csv_path": item["csv_path"],
+            "use_totals": use_totals,
+            "target_time_ns": target_time_ns,
+            "time_ns_used": info["time_ns_used"],
+            "row_index": info["row_index"],
+        }
+
+        for c in count_cols:
+            loaded_item[c] = counts[c]
+
+        loaded.append(loaded_item)
+
+        if use_totals:
+            print(
+                f"{item['label']} | "
+                + " | ".join([f"{c.upper()} total = {counts[c]:,.0f}" for c in count_cols])
+            )
+        else:
+            print(
+                f"{item['label']} | requested {target_time_ns:.2f} ns "
+                f"(using {info['time_ns_used']:.2f} ns) | "
+                + " | ".join([f"{c.upper()} = {counts[c]:,.0f}" for c in count_cols])
+            )
+
+    x = np.arange(len(x_categories))
+    n_bars = len(count_cols)
+    width = 0.8 / max(n_bars, 1)
+
+    if colors is None or len(colors) == 0:
+        default_colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", [])
+        if len(default_colors) >= n_bars:
+            colors = default_colors[:n_bars]
+        else:
+            colors = [None] * n_bars
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    for i, c in enumerate(count_cols):
+        offsets = x + (i - (n_bars - 1) / 2.0) * width
+        color = colors[i] if i < len(colors) else None
+
+        bars = ax.bar(
+            offsets,
+            values_by_count_col[c],
+            width=width,
+            label=count_labels.get(c, c.upper()),
+            color=color,
+            zorder=3,
+        )
+
+        if add_value_labels:
+            for bar, value in zip(bars, values_by_count_col[c]):
+                if np.isnan(value):
+                    continue
+
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2.0,
+                    bar.get_height(),
+                    f"{value:,.0f}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=9,
+                    rotation=0,
+                )
+
+    ax.set_xlabel(xlabel, fontsize=24)
+    ax.set_ylabel(ylabel, fontsize=24)
+
+    if title is None:
+        if use_totals:
+            title = "TP, FP, and FN Counts by Test Geometry"
+        else:
+            title = f"TP, FP, and FN Counts by Test Geometry at {target_time_ns:.2f} ns"
+
+    ax.set_title(title, fontsize=18)
+    ax.set_xticks(x)
+    ax.set_xticklabels(
+        [item["label"] for item in x_categories],
+        fontsize=18,
+        rotation=rotate_xticks,
+        ha="right" if rotate_xticks else "center",
+    )
+    ax.tick_params(axis="y", labelsize=14)
+    ax.grid(True, axis="y", alpha=0.3, zorder=0)
+    ax.set_axisbelow(True)
+    ax.legend(loc="upper left", fontsize=18)
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    print(f"Saved TP/FP/FN geometry bar plot to: {save_path}")
+
+    return {
+        "confusion_bar_plot_path": save_path,
+        "loaded_confusion_counts": loaded,
+        "x_labels": [item["label"] for item in x_categories],
+        "count_cols": tuple(count_cols),
+        "use_totals": use_totals,
+        "target_time_ns": target_time_ns,
+    }
+
+
+
+def plot_classification_metrics_bar_by_geometry(
+    csv_map: Dict[str, Dict[str, str]],
+    out_dir: str,
+    *,
+    out_name: str = "f1_recall_precision_bar_by_geometry.png",
+    title: Optional[str] = None,
+    show: bool = False,
+    model_order: Optional[Sequence[str]] = None,
+    geometry_order: Optional[Sequence[str]] = None,
+    use_totals: bool = True,
+    target_time_ns: Optional[float] = None,
+    metric_cols: Sequence[str] = ("f1", "recall", "precision"),
+    metric_labels: Optional[Dict[str, str]] = None,
+    colors: Optional[Sequence[str]] = None,
+    xlabel: str = "Test geometry",
+    ylabel: str = "Metric value",
+    figsize: tuple = (12, 7),
+    dpi: int = 300,
+    rotate_xticks: float = 0,
+    add_value_labels: bool = True,
+):
+    """
+    Create one grouped bar plot with F1, recall, and precision for each geometry.
+
+    Expected csv_map format for one model across different geometries:
+
+    csv_map = {
+        "ML": {
+            "Similar": "/path/to/per_frame_metrics.csv",
+            "Finer": "/path/to/per_frame_metrics.csv",
+            "Vertical": "/path/to/per_frame_metrics.csv",
+        }
+    }
+
+    X-axis groups are geometries. Within each geometry group, bars are F1,
+    recall, and precision.
+
+    If multiple outer models are passed, x labels become:
+        "ML: Similar", "ML + SED: Similar", etc.
+
+    Metrics are computed from summed TP/FP/FN over the full simulation when
+    use_totals=True. This is usually better than frame-wise averaging because
+    it gives one global full-rollout score per test case.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    save_path = os.path.join(out_dir, out_name)
+
+    allowed_metrics = {"f1", "recall", "precision"}
+    bad_metrics = set(metric_cols) - allowed_metrics
+    if bad_metrics:
+        raise ValueError(f"Unsupported metric_cols {bad_metrics}. Use only {allowed_metrics}.")
+
+    if metric_labels is None:
+        metric_labels = {
+            "f1": "F1",
+            "recall": "Recall",
+            "precision": "Precision",
+        }
+
+    if model_order is None:
+        model_order = list(csv_map.keys())
+
+    if len(model_order) == 0:
+        raise ValueError("No models found in csv_map.")
+
+    x_categories = []
+
+    if geometry_order is not None:
+        for model_name in model_order:
+            if model_name not in csv_map:
+                continue
+
+            for geom in geometry_order:
+                if geom not in csv_map[model_name]:
+                    continue
+
+                label = str(geom) if len(model_order) == 1 else f"{model_name}: {geom}"
+
+                x_categories.append(
+                    {
+                        "model": model_name,
+                        "geometry": geom,
+                        "label": label,
+                        "csv_path": csv_map[model_name][geom],
+                    }
+                )
+    else:
+        for model_name in model_order:
+            if model_name not in csv_map:
+                continue
+
+            for geom, csv_path in csv_map[model_name].items():
+                label = str(geom) if len(model_order) == 1 else f"{model_name}: {geom}"
+
+                x_categories.append(
+                    {
+                        "model": model_name,
+                        "geometry": geom,
+                        "label": label,
+                        "csv_path": csv_path,
+                    }
+                )
+
+    if len(x_categories) == 0:
+        raise ValueError("No geometry CSV entries found in csv_map.")
+
+    loaded = []
+    values_by_metric = {m: [] for m in metric_cols}
+
+    for item in x_categories:
+        info = _extract_classification_metrics_from_csv(
+            item["csv_path"],
+            use_totals=use_totals,
+            target_time_ns=target_time_ns,
+        )
+
+        metrics = info["metrics"]
+        counts = info["counts"]
+
+        for m in metric_cols:
+            values_by_metric[m].append(metrics[m])
+
+        loaded_item = {
+            "model": item["model"],
+            "geometry": item["geometry"],
+            "label": item["label"],
+            "csv_path": item["csv_path"],
+            "use_totals": use_totals,
+            "target_time_ns": target_time_ns,
+            "time_ns_used": info["time_ns_used"],
+            "row_index": info["row_index"],
+            "tp": counts["tp"],
+            "fp": counts["fp"],
+            "fn": counts["fn"],
+        }
+
+        for m in metric_cols:
+            loaded_item[m] = metrics[m]
+
+        loaded.append(loaded_item)
+
+        if use_totals:
+            print(
+                f"{item['label']} | "
+                f"F1 = {metrics['f1']:.4f} | "
+                f"Recall = {metrics['recall']:.4f} | "
+                f"Precision = {metrics['precision']:.4f} | "
+                f"TP = {counts['tp']:,.0f} | FP = {counts['fp']:,.0f} | FN = {counts['fn']:,.0f}"
+            )
+        else:
+            print(
+                f"{item['label']} | requested {target_time_ns:.2f} ns "
+                f"(using {info['time_ns_used']:.2f} ns) | "
+                f"F1 = {metrics['f1']:.4f} | "
+                f"Recall = {metrics['recall']:.4f} | "
+                f"Precision = {metrics['precision']:.4f}"
+            )
+
+    x = np.arange(len(x_categories))
+    n_bars = len(metric_cols)
+    width = 0.8 / max(n_bars, 1)
+
+    if colors is None or len(colors) == 0:
+        default_colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", [])
+        if len(default_colors) >= n_bars:
+            colors = default_colors[:n_bars]
+        else:
+            colors = [None] * n_bars
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    for i, m in enumerate(metric_cols):
+        offsets = x + (i - (n_bars - 1) / 2.0) * width
+        color = colors[i] if i < len(colors) else None
+
+        bars = ax.bar(
+            offsets,
+            values_by_metric[m],
+            width=width,
+            label=metric_labels.get(m, m.upper()),
+            color=color,
+            zorder=3,
+        )
+
+        if add_value_labels:
+            for bar, value in zip(bars, values_by_metric[m]):
+                if np.isnan(value):
+                    continue
+
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2.0,
+                    bar.get_height(),
+                    f"{value:.3f}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=16,
+                    rotation=0,
+                )
+
+    ax.set_xlabel(xlabel, fontsize=24)
+    ax.set_ylabel(ylabel, fontsize=24)
+    ax.set_ylim(0.0, 1.05)
+
+    if title is None:
+        if use_totals:
+            title = "F1, Recall, and Precision by Test Geometry"
+        else:
+            title = f"F1, Recall, and Precision by Test Geometry at {target_time_ns:.2f} ns"
+
+    #ax.set_title(title, fontsize=18)
+    ax.set_xticks(x)
+    ax.set_xticklabels(
+        [item["label"] for item in x_categories],
+        fontsize=20,
+        rotation=rotate_xticks,
+        ha="right" if rotate_xticks else "center",
+    )
+    ax.tick_params(axis="y", labelsize=14)
+    ax.grid(True, axis="y", alpha=0.3, zorder=0)
+    ax.set_axisbelow(True)
+    ax.legend(loc="upper left", fontsize=16)
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    print(f"Saved F1/Recall/Precision geometry bar plot to: {save_path}")
+
+    return {
+        "classification_metrics_bar_plot_path": save_path,
+        "loaded_classification_metrics": loaded,
+        "x_labels": [item["label"] for item in x_categories],
+        "metric_cols": tuple(metric_cols),
+        "use_totals": use_totals,
+        "target_time_ns": target_time_ns,
+    }
 
 def plot_f1_full_simulation_comparison(
     csv_map: Dict[str, Dict[str, str]],
@@ -708,16 +1255,38 @@ def plot_f1_full_simulation_comparison(
     incorrect_over_predunion_colors_sed: Optional[Sequence[str]] = None,
     individual_incorrect_over_predunion_color: Optional[str] = None,
     loss_colors: Optional[Sequence[str]] = None,
-    loss_out_name: str = "training_loss_comparison.png",
-    val_loss_out_name: str = "validation_loss_comparison.png",
-    loss_title: str = "Training Loss Comparison",
-    val_loss_title: str = "Validation Loss Comparison",
+    loss_out_name: str = "training_and_validation_loss_comparison.png",
+    val_loss_out_name: str = "training_and_validation_loss_comparison.png",
+    loss_title: str = "Training and Validation Loss Comparison",
+    val_loss_title: str = "Training and Validation Loss Comparison",
     loss_max_epoch: Optional[float] = None,
     make_f1_bar_at_time: bool = False,
     f1_bar_time_ns: Optional[float] = None,
     f1_bar_out_name: str = "f1_bar_comparison_at_time.png",
     f1_bar_title: Optional[str] = None,
     f1_bar_colors: Optional[Sequence[str]] = None,
+
+    # New TP / FP / FN geometry bar plot controls
+    make_confusion_bar_by_geometry: bool = False,
+    confusion_bar_out_name: str = "tp_fp_fn_bar_by_geometry.png",
+    confusion_bar_title: Optional[str] = None,
+    confusion_bar_use_totals: bool = True,
+    confusion_bar_time_ns: Optional[float] = None,
+    confusion_bar_model_order: Optional[Sequence[str]] = None,
+    confusion_bar_geometry_order: Optional[Sequence[str]] = None,
+    confusion_bar_colors: Optional[Sequence[str]] = None,
+    confusion_bar_xlabel: str = "Test geometry",
+
+    # New F1 / Recall / Precision geometry bar plot controls
+    make_classification_metrics_bar_by_geometry: bool = False,
+    classification_metrics_bar_out_name: str = "f1_recall_precision_by_geometry.png",
+    classification_metrics_bar_title: Optional[str] = None,
+    classification_metrics_bar_use_totals: bool = True,
+    classification_metrics_bar_time_ns: Optional[float] = None,
+    classification_metrics_bar_model_order: Optional[Sequence[str]] = None,
+    classification_metrics_bar_geometry_order: Optional[Sequence[str]] = None,
+    classification_metrics_bar_colors: Optional[Sequence[str]] = None,
+    classification_metrics_bar_xlabel: str = "Test geometry",
 ):
     """
     Make:
@@ -728,6 +1297,8 @@ def plot_f1_full_simulation_comparison(
       5. Relative incorrect-prediction plots where (fp + fn) / (tp + fp + fn)
       6. Optional training/validation loss plots from training log CSVs
       7. Optional grouped F1 bar chart at a requested time_ns
+      8. Optional TP/FP/FN grouped bar chart by test geometry
+      9. Optional F1/Recall/Precision grouped bar chart by test geometry
     """
     os.makedirs(out_dir, exist_ok=True)
 
@@ -1142,6 +1713,53 @@ def plot_f1_full_simulation_comparison(
             bar_colors=f1_bar_colors,
         )
 
+    confusion_bar_info = None
+    if make_confusion_bar_by_geometry:
+        if not confusion_bar_use_totals and confusion_bar_time_ns is None:
+            raise ValueError(
+                "confusion_bar_time_ns must be provided when "
+                "confusion_bar_use_totals=False"
+            )
+
+        confusion_bar_info = plot_confusion_counts_bar_by_geometry(
+            csv_map,
+            out_dir,
+            out_name=confusion_bar_out_name,
+            title=confusion_bar_title,
+            show=show,
+            model_order=confusion_bar_model_order,
+            geometry_order=confusion_bar_geometry_order,
+            use_totals=confusion_bar_use_totals,
+            target_time_ns=confusion_bar_time_ns,
+            colors=confusion_bar_colors,
+            xlabel=confusion_bar_xlabel,
+        )
+
+    classification_metrics_bar_info = None
+    if make_classification_metrics_bar_by_geometry:
+        if (
+            not classification_metrics_bar_use_totals
+            and classification_metrics_bar_time_ns is None
+        ):
+            raise ValueError(
+                "classification_metrics_bar_time_ns must be provided when "
+                "classification_metrics_bar_use_totals=False"
+            )
+
+        classification_metrics_bar_info = plot_classification_metrics_bar_by_geometry(
+            csv_map,
+            out_dir,
+            out_name=classification_metrics_bar_out_name,
+            title=classification_metrics_bar_title,
+            show=show,
+            model_order=classification_metrics_bar_model_order,
+            geometry_order=classification_metrics_bar_geometry_order,
+            use_totals=classification_metrics_bar_use_totals,
+            target_time_ns=classification_metrics_bar_time_ns,
+            colors=classification_metrics_bar_colors,
+            xlabel=classification_metrics_bar_xlabel,
+        )
+
     return {
         "all_plot_path": save_all,
         "base_plot_path": save_base if base_map else None,
@@ -1207,4 +1825,16 @@ def plot_f1_full_simulation_comparison(
 
         "f1_bar_info": f1_bar_info,
         "f1_bar_plot_path": None if f1_bar_info is None else f1_bar_info["bar_plot_path"],
+
+        "confusion_bar_info": confusion_bar_info,
+        "confusion_bar_plot_path": (
+            None if confusion_bar_info is None
+            else confusion_bar_info["confusion_bar_plot_path"]
+        ),
+
+        "classification_metrics_bar_info": classification_metrics_bar_info,
+        "classification_metrics_bar_plot_path": (
+            None if classification_metrics_bar_info is None
+            else classification_metrics_bar_info["classification_metrics_bar_plot_path"]
+        ),
     }

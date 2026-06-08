@@ -17,6 +17,7 @@ def csv_dataset_from_directory(
     pattern="**/*.csv",
     batch_size=5,
     shuffle=False,
+    # IMPORTANT: downstream expects "SED" as the canonical column name.
     # Files may contain either "SED" or legacy "a_pos"; we normalize to "SED".
     feature_cols=("fracture_mask", "x", "y", "ux", "uy", "Gc", "pressure", "vonmises", "SED"),
     target_col="fracture_mask",
